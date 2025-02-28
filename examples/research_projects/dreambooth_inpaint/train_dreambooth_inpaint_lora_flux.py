@@ -104,7 +104,7 @@ def save_model_card(
 
 These are {repo_id} DreamBooth LoRA weights for {base_model}.
 
-The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [Flux diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_flux.md).
+The weights were trained using [DreamBooth](https://dreambooth.github.io/) with a custom [Flux diffusers trainer](https://github.com/Sebastian-Zok/FLUX-Fill-LoRa-Training).
 
 Was LoRA for the text encoder enabled? {train_text_encoder}.
 
@@ -169,40 +169,21 @@ def prepare_mask_and_masked_image(image, mask):
 
     masked_image = image * (mask < 0.5)
     
-    #masked_image = image * (1 - mask_image)
-    #masked_image = masked_image.to(device=device, dtype=prompt_embeds.dtype)
     return mask, masked_image
-
-# generate random masks
-def random_mask(im_shape, ratio=1, mask_full_image=False):
-    """    mask = Image.new("L", im_shape, 0)
-    draw = ImageDraw.Draw(mask)
-    size = (random.randint(0, int(im_shape[0] * ratio)), random.randint(0, int(im_shape[1] * ratio)))
-    # use this to always mask the whole image
-    if mask_full_image:
-        size = (int(im_shape[0] * ratio), int(im_shape[1] * ratio))
-    limits = (im_shape[0] - size[0] // 2, im_shape[1] - size[1] // 2)
-    center = (random.randint(size[0] // 2, limits[0]), random.randint(size[1] // 2, limits[1]))
-    draw_type = random.randint(0, 1)
-    if draw_type == 0 or mask_full_image:
-        draw.rectangle(
-            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
-            fill=255,
-        )
-    else:
-        draw.ellipse(
-            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
-            fill=255,
-        )"""
     
-    mask = Image.new("L", im_shape, 0)   
-    draw = ImageDraw.Draw(mask)
+def get_mask(im_shape, original_image_path, mask_data_path):
+    # Extract only the file name from the original path
+    _, filename = os.path.split(original_image_path)
 
-    mask_area = (im_shape[0] // 2, 0, im_shape[0], im_shape[1])   
- 
-    # Zeichne die Maske (weiß)
-    draw.rectangle(mask_area, fill=255)
+    # Construct the mask path (adjust as needed)
+    mask_path = os.path.join(mask_data_path, filename)
+    # Load and ensure single-channel
+    mask = Image.open(mask_path).convert("L")
     
+    # Resize the mask to match your desired final image size if needed
+    # Note: im_shape is typically (width, height)
+    mask = mask.resize(im_shape, Image.NEAREST)
+
     return mask
 
 
@@ -324,6 +305,13 @@ def parse_args(input_args=None):
         default=None,
         help=("A folder containing the training data. "),
     )
+    
+    parser.add_argument(
+        "--mask_data_dir",
+        type=str,
+        default=None,
+        help=("A folder containing the mask data. "),
+    )
 
     parser.add_argument(
         "--cache_dir",
@@ -380,6 +368,18 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help="A prompt that is used during validation to verify that the model is learning.",
+    )
+    parser.add_argument(
+        "--validation_image",
+        type=str,
+        default=None,
+        help="A file path to a local or remote (https) image file that is used during validation to verify that the model is learning.",
+    )
+    parser.add_argument(
+        "--validation_mask",
+        type=str,
+        default=None,
+        help="A file path to a local or remote (https) image file that is used as mask for the inpainting task during validation to verify that the model is learning.",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -718,6 +718,9 @@ def parse_args(input_args=None):
 
     if args.dataset_name is not None and args.instance_data_dir is not None:
         raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
+    
+    if args.mask_data_dir is None:
+        raise ValueError("Specify a --mask_data_dir`")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -747,6 +750,7 @@ class DreamBoothDataset(Dataset):
     def __init__(
         self,
         instance_data_root,
+        mask_data_root,
         instance_prompt,
         class_prompt,
         class_data_root=None,
@@ -759,6 +763,8 @@ class DreamBoothDataset(Dataset):
         self.center_crop = center_crop
 
         self.instance_prompt = instance_prompt
+        self.mask_data_root = mask_data_root
+
         self.custom_instance_prompts = None
         self.class_prompt = class_prompt
 
@@ -896,10 +902,10 @@ class DreamBoothDataset(Dataset):
             pil_image = pil_image.convert("RGB")
         pil_image = self.image_transforms_resize_and_crop(pil_image)
         example["PIL_images"] = pil_image
-
-        
+        example["image_path"] = self.instance_images_path[index % self.num_instance_images]
+        example["mask_data_path"] = self.mask_data_root
         instance_image = self.pixel_values[index % self.num_instance_images]
-        print(instance_image.shape)
+        #print(instance_image.shape)
         example["instance_images"] = instance_image
 
         if self.custom_instance_prompts:
@@ -938,8 +944,8 @@ def collate_fn(examples, with_prior_preservation=False):
     masked_images = []    
     for example in examples:
             pil_image = example["PIL_images"]  # Here maybe PilImages
-            # generate a random mask
-            mask = random_mask(pil_image.size, 1, False)
+            # Get Mask
+            mask = get_mask(pil_image.size, example["image_path"], example["mask_data_path"], 1, False)
             # prepare mask and masked image
             mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
 
@@ -1570,6 +1576,7 @@ def main(args):
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
+        mask_data_root=args.mask_data_dir,
         instance_prompt=args.instance_prompt,
         class_prompt=args.class_prompt,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
@@ -1838,14 +1845,14 @@ def main(args):
                     batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
                 ).latent_dist.sample()
                 masked_image_latents = (masked_image_latents - vae.config.shift_factor) * vae.config.scaling_factor
-                print("masked image latents", masked_image_latents.shape)
+                #print("masked image latents", masked_image_latents.shape)
 
                 masks = batch["masks"]
-                print("masks ", masks.shape)
-                print("mask  ", masks )
-                print("scale", vae_scale_factor)
-                print("scale", args.resolution)
-                print("scale", model_input.shape[2])
+                #print("masks ", masks.shape)
+                #print("mask  ", masks )
+                #print("scale", vae_scale_factor)
+                #print("scale", args.resolution)
+                #print("scale", model_input.shape[2])
 
                 mask = masks
                 # resize the mask to latents shape as we concatenate the mask to the latents
@@ -1865,7 +1872,7 @@ def main(args):
                 mask = mask.reshape(
                     model_input.shape[0], vae_scale_factor * vae_scale_factor, model_input.shape[2], model_input.shape[3]
                 )  # ba
-                print("mask ", mask.shape)
+                #print("mask ", mask.shape)
 
 
                 latent_image_ids = FluxFillPipeline._prepare_latent_image_ids(
@@ -1920,9 +1927,9 @@ def main(args):
                     height=model_input.shape[2],
                     width=model_input.shape[3],
                 )
-                print("packed masked image latents", masked_image_latents.shape)
-                print("model input", model_input)
-                print("model inputhshae", model_input.shape)
+                #print("packed masked image latents", masked_image_latents.shape)
+                #print("model input", model_input)
+                #print("model inputhshae", model_input.shape)
                 mask = FluxFillPipeline._pack_latents(
                     mask,
                     batch_size=model_input.shape[0],
@@ -1930,14 +1937,14 @@ def main(args):
                     height=model_input.shape[2],
                     width=model_input.shape[3],
                 )
-                print("packed mask ", mask.shape)
+                #print("packed mask ", mask.shape)
                 
                 masked_image_latents = torch.cat((masked_image_latents, mask), dim=-1)
-                print("concat masked image latents", masked_image_latents.shape)     
+                #print("concat masked image latents", masked_image_latents.shape)     
                     
                 transformer_input = torch.cat((packed_noisy_model_input, masked_image_latents), dim=2)    
-                print(packed_noisy_model_input.shape)
-                print("hidden states latents", transformer_input.shape)
+                #print(packed_noisy_model_input.shape)
+                #print("hidden states latents", transformer_input.shape)
 
                 # Predict the noise residual
                 model_pred = transformer(
@@ -2055,8 +2062,8 @@ def main(args):
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-                val_image = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/image.png")
-                val_mask = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/mask.png")
+                val_image = load_image(args.validation_image)
+                val_mask = load_image(args.validation_mask)
 
                 pipeline_args = {"prompt": args.validation_prompt, "image": val_image, "mask_image": val_mask}
                 images = log_validation(
@@ -2111,8 +2118,8 @@ def main(args):
         # run inference
         images = []
         if args.validation_prompt and args.num_validation_images > 0:
-            val_image = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/image.png")
-            val_mask = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/mask.png")
+            val_image = load_image(args.validation_image)
+            val_mask = load_image(args.validation_mask)
 
             pipeline_args = {"prompt": args.validation_prompt, "image": val_image, "mask_image": val_mask}
             images = log_validation(

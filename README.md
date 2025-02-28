@@ -13,25 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
+
 # FLUX-Fill-LoRa-Training
 
-This repository provides a fork of the [🤗 Diffusers](https://github.com/huggingface/diffusers) library with an example script for LoRA training on the new **FLUX.1-Fill** models. The script isn't optimized and was just tested on an NVIDIA A100 GPU. If anyone has a similar script for frameworks like SimpleTuner or SD-scripts, that run on consumer hardware, I would be more than happy to hear!
+This repository provides a fork of the [🤗 Diffusers](https://github.com/huggingface/diffusers) library with an example script for LoRA training on the new **FLUX.1-Fill** models. FLUX has very strong in-context capabilites, making it a suitable choice for a range of tasks, beside classical character LoRa training.
+
+> **Note**: The script isn't optimized and was just tested on an NVIDIA A100 GPU (80GB VRAM). If anyone has a similar script for frameworks like SimpleTuner or SD-scripts, that runs on consumer hardware, I would be more than happy to hear!
 
 ## Overview
 
-The provided script implements a specific masking strategy, in my case applying a mask to the right half of the image. If your use case requires a different masking approach, you’ll need to adapt the `random_mask` function accordingly.
+In order to use this script you need to have a dataset of images and the corresponding masks for inpainting. The masks are simple black images with the white spots for the inpainting area as can be seen in the example below. The corresponding mask needs to have the same filename as the original image. If you have a specific masking strategy, like masking just the right half of the image or applying a random mask, you can adapt the `get_mask` function of the script accordingly.
 
-**Note:**  
-Validation images and masks are currently hardcoded in the script. You will need to modify these to suit your dataset. See the lines:
-
-```python
-val_image = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/image.png")
-val_mask = load_image("https://huggingface.co/datasets/sebastianzok/validationImageAndMask/resolve/main/mask.png")
-```
-Known Issue
-Validation only works at the start and end of training. During intermediate validation steps, only black images occur ([See this open issue](https://github.com/huggingface/diffusers/issues/9476)). Luckily the LoRa was able to catch my concept just with 300 steps, so I did not really depend on the validation images.
-
-
+<img src="examples/research_projects/dreambooth_inpaint/images/mask_example.jpg" alt="Mask Example" width="400" height="200">
 
 ## Installation
 
@@ -42,6 +35,7 @@ pip install -e .
 ```
 
 Then cd in the `examples/research_projects/dreambooth_inpaint` folder and run
+
 ```bash
 pip install -r requirements_flux.txt
 ```
@@ -68,10 +62,50 @@ write_basic_config()
 When running `accelerate config`, if we specify torch compile mode to True there can be dramatic speedups.
 Note also that we use PEFT library as backend for LoRA training, make sure to have `peft>=0.6.0` installed in your environment.
 
+### Optional
 
+You might also find the following steps useful:
+
+1. Install Weights & Biases for experiment tracking:
+
+```bash
+pip install wandb
+wandb login
+```
+
+2. Install ProdigyOpt for optimization:
+
+```bash
+pip install prodigyopt
+```
+
+3. Login to Huggingface to push your model or download private datasets:
+
+```bash
+huggingface-cli login
+```
 
 ## Load your Dataset
-For my case the dataset consisted of just plain images without image captions. Since I trained the LoRa on a specific task, I used the instance_prompt parameter for all generations. This is much more convinient than the in-context LoRa approach, that I used to learn concepts using the normal FLUX.1-dev model. Also there are no mask images, since it was hard coded for my use case (see random_mask).
+
+In this example we use the corgi dog dataset from diffusers.
+
+```bash
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "diffusers/dog-example",
+    local_dir= "./dog", repo_type="dataset",
+    ignore_patterns=".gitattributes",
+)
+
+snapshot_download(
+    "sebastianzok/dog-example-masks",
+    local_dir= "./dog_masks", repo_type="dataset",
+    ignore_patterns=".gitattributes",
+)
+```
+
+> **Disclaimer**: Before proceeding, ensure you move the `dog` and `dog_masks` folders to the appropriate directory and delete their `.cache` directories using `rm -r .cache`
 
 ## Train
 
@@ -80,15 +114,17 @@ Now, we can launch training using:
 ```bash
 export MODEL_NAME="black-forest-labs/FLUX.1-Fill-dev"
 export INSTANCE_DIR="dog"
-export OUTPUT_DIR="trained-flux"
+export MASK_DIR="dog_masks"
+export OUTPUT_DIR="flux-fill-dog-lora"
 
 accelerate launch train_dreambooth_inpaint_lora_flux.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
   --instance_data_dir=$INSTANCE_DIR \
+  --mask_data_dir=$MASK_DIR
   --output_dir=$OUTPUT_DIR \
   --mixed_precision="bf16" \
-  --instance_prompt="A character turnaround 45-degreed to the left" \
-  --resolution=1024 \
+  --instance_prompt="A TOK dog" \
+  --resolution=512 \
   --train_batch_size=1 \
   --guidance_scale=1 \
   --gradient_accumulation_steps=4 \
@@ -97,13 +133,34 @@ accelerate launch train_dreambooth_inpaint_lora_flux.py \
   --report_to="wandb" \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
+  --checkpointing_steps=50 \
   --max_train_steps=500 \
-  --validation_prompt="A character turnaround 45-degreed to the left" \
+  --validation_prompt="A TOK dog" \
   --validation_epochs=25 \
+  --validation_image="./dog/alvan-nee-9M0tSjb-cpA-unsplash.jpeg" \
+  --validation_mask="./dog_mask/alvan-nee-9M0tSjb-cpA-unsplash.jpeg" \
   --seed="0" \
   --push_to_hub
 ```
 
+**Known Issue:** Validation epochs seem to not work, but anyway validation occurs at each checkpointing step.
+
+## Results
+
+<img src="examples/research_projects/dreambooth_inpaint/images/sample1.jpg" alt="Mask Example" width="850" height="200">
+
+As you can see the LoRa was successful to recreate the corgi on this non cherry picked example after around 400 training steps. But don't expect a good quality, as the corgi dataset is very limited.
+
+You can also test the script on other tasks like for example a pose transfer. Here the LoRa was trained on creating a 45-degree turn of a character. The front pose is given as reference and the right half of the image was masked to generate the 45-degree view. This approach revealed to work extremly well, as can be seen on this example:
+
+<img src="examples/research_projects/dreambooth_inpaint/images/sample2.jpg" alt="Mask Example" width="500" height="500">
+
+Another test was on creating 3D-icons based on a reference. Note that this example was extremly cherrypicked and usually did not generate anything usable. The dataset was small and just a quick and dirty PoC.
+
+<img src="examples/research_projects/dreambooth_inpaint/images/sample3.jpg" alt="Mask Example" width="450" height="300">
+
+> **Tip**: From my tests, it is advisable to add a trigger word like `TOK` or `p3rs0n` to your instance prompt. Additionally, include everything that you do not want the model to learn in the instance prompt, such as a white background.
+
 ## Contributions and Feedback
-As you might have noticed there is a lot of room for improvement 🙃. Feel free to open issues or submit pull requests to improve this project. If you have insights on adapting this script for other frameworks like SimpleTuner, please share your experiences!
- 
+
+Feel free to open issues or submit pull requests to improve this project. If you have insights on adapting this script for other frameworks like SimpleTuner, please share your experiences! Additionally, I would love to see the samples you create using this script, so don't hesitate to share them!
